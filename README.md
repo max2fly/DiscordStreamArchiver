@@ -63,5 +63,5 @@ pnpm build
 
 # Known bugs
 
-- Auto subscribe doesn't subscribe to all streams, only to the right most one
+- Auto subscribe doesn't subscribe to all streams, only to the right most one (Triaged)
 - Multi-stream compacts into small boxes (Not planned to fix)
