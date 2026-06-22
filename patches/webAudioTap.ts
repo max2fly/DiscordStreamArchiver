@@ -91,16 +91,31 @@ export function onStreamDataSeen(data: DiscordStreamData): void {
             logger.info(`webAudioTap: captured stream for user ${data.id} (total seen=${streamsSeen})`);
         }
 
-        const existing = activeTaps.get(data.id);
+        // Discord's RTC layer can fire this hook with the same `data.id` (the
+        // user id) for both a user's voice Output and their screenshare /
+        // camera Output. Keying both under the same slot lets whichever
+        // stream arrives second clobber the first — observed as: when
+        // recording starts while someone is already streaming, voice is
+        // silent in the recording but their stream's desktop/game audio
+        // plays through. Distinguish by track composition so they coexist:
+        // audio-only streams (voice) keep `data.id`; video-bearing streams
+        // (screenshare / camera) get `${data.id}:video`. Lookups for voice
+        // (getParticipantAudioStream) hit the bare id; screenshare scans
+        // (reconcileScreenshares, StreamTap fallback) match by substring
+        // and still find the :video entry.
+        const hasVideo = data.stream.getVideoTracks().length > 0;
+        const key = hasVideo ? `${data.id}:video` : data.id;
+
+        const existing = activeTaps.get(key);
         if (existing?.stream === data.stream) return; // idempotent: same call fires repeatedly
 
-        activeTaps.set(data.id, { stream: data.stream, audioContext: data.audioContext });
+        activeTaps.set(key, { stream: data.stream, audioContext: data.audioContext });
         attachStreamTrackListeners(data.stream);
 
         for (const track of data.stream.getAudioTracks()) {
             track.addEventListener("ended", () => {
-                if (activeTaps.get(data.id)?.stream === data.stream) {
-                    activeTaps.delete(data.id);
+                if (activeTaps.get(key)?.stream === data.stream) {
+                    activeTaps.delete(key);
                     notifyChange();
                 }
             });

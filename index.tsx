@@ -136,7 +136,18 @@ function getParticipantAudioStream(userId: string): MediaStream | null {
     // audio pipeline. On Discord Desktop voice audio is native-only, so the
     // registry stays empty and we return null (loopback mode handles that
     // case by mixing the system audio output in as a single track).
-    return getTappedStream(userId)?.stream ?? null;
+    //
+    // Defensive: webAudioTap re-keys video-bearing streams under
+    // `${userId}:video` so screenshare/camera Outputs don't clobber voice,
+    // but if a stream gained a video track AFTER initial registration the
+    // bare `userId` slot could still hold a video-bearing stream. Reject
+    // those — `createMediaStreamSource` would otherwise pick up the
+    // screenshare's first audio track (game/desktop audio) and mix it in
+    // place of voice.
+    const tap = getTappedStream(userId);
+    if (!tap) return null;
+    if (tap.stream.getVideoTracks().length > 0) return null;
+    return tap.stream;
 }
 
 type ResolvedAudioMode = "web-audio" | "loopback" | "none";
