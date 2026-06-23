@@ -561,7 +561,11 @@ function chatMessageFromPayload(m: any): ChatMessage {
     if (ref?.author?.id) {
         const refAuthor = ref.author;
         const refName = refAuthor.global_name || refAuthor.username || "unknown";
-        const snippet = String(ref.content ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
+        // Keep the raw emote/mention syntax intact — the renderer parses it
+        // into inline emotes/mentions for the preview. Slice generously (a
+        // single emote is ~25 chars) and let width-based truncation in
+        // drawReplySnippet decide what actually fits on the one preview line.
+        const snippet = String(ref.content ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
         replyTo = {
             authorId: refAuthor.id,
             authorName: refName,

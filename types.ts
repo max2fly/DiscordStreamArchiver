@@ -103,7 +103,7 @@ export interface ChatReplyContext {
     authorId: string;
     authorName: string;
     avatarUrl: string;
-    contentSnippet: string;   // truncated to ~80 chars
+    contentSnippet: string;   // raw content (emote/mention syntax kept), capped ~200 chars
 }
 
 export interface ChatSticker {

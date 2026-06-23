@@ -41,7 +41,9 @@ function isJumboEmote(m: ChatMessage, tokens: ContentToken[]): boolean {
     if (m.attachments.length !== 0) return false;
     if ((m.embeds?.length ?? 0) !== 0) return false;
     if ((m.stickers?.length ?? 0) !== 0) return false;
-    if (m.replyTo) return false;
+    // NOTE: a reply does NOT disqualify jumbo. Discord renders an emote-only
+    // reply with large emoji — the reply reference bar sits above the content
+    // and is independent of how the content itself is sized.
     let emoteCount = 0;
     for (const t of tokens) {
         if (t.kind === "emote" || t.kind === "unicodeEmoji") { emoteCount++; continue; }

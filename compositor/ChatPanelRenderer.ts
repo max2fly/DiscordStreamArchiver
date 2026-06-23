@@ -20,6 +20,9 @@ const CODE_BG = "#2b2d31";
 const MESSAGE_PADDING = 12;
 const AVATAR_SIZE = 32;
 const REPLY_AVATAR_SIZE = 16;
+// Emotes inside the reply preview render at line height — small, never jumbo,
+// regardless of how the replied-to message itself was sized.
+const REPLY_EMOTE_SIZE = 16;
 const ATTACHMENT_MAX_WIDTH = 280;
 const ATTACHMENT_MAX_HEIGHT = 200;
 
@@ -40,6 +43,9 @@ export class ChatPanelRenderer {
     // tokens — only populated for edited messages. The renderer draws
     // these in gray above the current content as edit history.
     private messageOriginalTokens = new Map<string, ContentToken[]>();
+    // Parsed tokens for the reply preview's snippet, so custom emotes/mentions
+    // in a replied-to message render inline instead of as raw "<:name:id>".
+    private messageReplyTokens = new Map<string, ContentToken[]>();
     private dirty = true;
     private images: ImageCache;
     // Avatars get their own cache so the constant churn of large attachment /
@@ -68,6 +74,7 @@ export class ChatPanelRenderer {
         this.mentionResolvers = resolvers;
         this.messageTokens.clear();
         this.messageOriginalTokens.clear();
+        this.messageReplyTokens.clear();
         this.messageHeights.clear();
         for (const m of this.messages) this.cacheTokens(m);
         for (const m of this.messages) this.messageHeights.set(m.id, this.computeHeight(m));
@@ -101,6 +108,7 @@ export class ChatPanelRenderer {
         this.messageHeights.delete(id);
         this.messageTokens.delete(id);
         this.messageOriginalTokens.delete(id);
+        this.messageReplyTokens.delete(id);
         this.dirty = true;
     }
 
@@ -143,11 +151,24 @@ export class ChatPanelRenderer {
         } else {
             this.messageOriginalTokens.delete(msg.id);
         }
+        if (msg.replyTo) {
+            this.messageReplyTokens.set(msg.id, parseContent(msg.replyTo.contentSnippet, this.mentionResolvers));
+        } else {
+            this.messageReplyTokens.delete(msg.id);
+        }
     }
 
     private preloadMessageImages(msg: ChatMessage): void {
         this.avatars.preload(msg.avatarUrl);
-        if (msg.replyTo) this.avatars.preload(msg.replyTo.avatarUrl);
+        if (msg.replyTo) {
+            this.avatars.preload(msg.replyTo.avatarUrl);
+            // Custom emotes in the reply preview share the same CDN URL (and
+            // thus cache entry) as emotes in normal message content, so this is
+            // a no-op when the emote was already seen elsewhere.
+            for (const tok of this.messageReplyTokens.get(msg.id) ?? []) {
+                if (tok.kind === "emote") this.preloadMaybeAnimated(tok.url, tok.animated);
+            }
+        }
         const tokens = this.messageTokens.get(msg.id) ?? [];
         for (const tok of tokens) {
             if (tok.kind === "emote") {
@@ -330,7 +351,8 @@ export class ChatPanelRenderer {
         let offset = 0;
 
         if (msg.replyTo) {
-            offset += this.drawReplyHeader(ctx, msg.replyTo, y, contentX, contentWidth) + 4;
+            const replyTokens = this.messageReplyTokens.get(msg.id) ?? [];
+            offset += this.drawReplyHeader(ctx, msg.replyTo, replyTokens, y, contentX, contentWidth) + 4;
         }
 
         const avatarTop = y + offset;
@@ -344,7 +366,14 @@ export class ChatPanelRenderer {
 
         ctx.font = TIMESTAMP_FONT;
         ctx.fillStyle = TIMESTAMP_COLOR;
-        ctx.fillText(formatRel(msg.relativeMs), contentX + authorW + 8, avatarTop + 2);
+        // Local wall-clock + timezone, then VOD-relative time in parens, so a
+        // viewer can line a chat message up against both real time and the
+        // recording's playhead: "14:03:27 UTC-4 (00:01)".
+        ctx.fillText(
+            `${formatLocalTime(msg.timestampMs)} (${formatRel(msg.relativeMs)})`,
+            contentX + authorW + 8,
+            avatarTop + 2
+        );
 
         offset += LINE_HEIGHT;
 
@@ -460,6 +489,7 @@ export class ChatPanelRenderer {
     private drawReplyHeader(
         ctx: CanvasRenderingContext2D,
         reply: ChatReplyContext,
+        replyTokens: ContentToken[],
         y: number,
         contentX: number,
         contentWidth: number
@@ -483,11 +513,44 @@ export class ChatPanelRenderer {
         ctx.fillText(authorLabel, textX, y + 1);
         const authorW = ctx.measureText(authorLabel).width;
         const snippetX = textX + authorW + 6;
-        const snippet = truncate(ctx, reply.contentSnippet, Math.max(1, textW - authorW - 6));
-        ctx.fillStyle = "#999";
-        ctx.fillText(snippet, snippetX, y + 1);
+        this.drawReplySnippet(ctx, replyTokens, snippetX, y + 1, Math.max(1, textW - authorW - 6));
 
         return SMALL_LINE_HEIGHT;
+    }
+
+    // Single-line reply preview: text inline with small (line-height) custom
+    // emotes, truncated with an ellipsis when it overruns the available width.
+    // Distinct from the main content layout — that path wraps and can render
+    // jumbo; a reply preview never does either.
+    private drawReplySnippet(
+        ctx: CanvasRenderingContext2D,
+        tokens: ContentToken[],
+        x: number, y: number, maxWidth: number
+    ): void {
+        const right = x + maxWidth;
+        const emoteY = y + (SMALL_LINE_HEIGHT - REPLY_EMOTE_SIZE) / 2;
+        let cx = x;
+        for (const part of flattenReplyTokens(tokens)) {
+            if (cx >= right) break;
+            if (part.kind === "emote") {
+                if (cx + REPLY_EMOTE_SIZE > right) { ctx.fillStyle = "#999"; ctx.fillText("…", cx, y); break; }
+                const img = this.animated.getFrame(part.url) ?? this.images.get(part.url);
+                if (img) ctx.drawImage(img, cx, emoteY, REPLY_EMOTE_SIZE, REPLY_EMOTE_SIZE);
+                else { ctx.fillStyle = "#444"; ctx.fillRect(cx, emoteY, REPLY_EMOTE_SIZE, REPLY_EMOTE_SIZE); }
+                cx += REPLY_EMOTE_SIZE + 2;
+                continue;
+            }
+            ctx.font = REPLY_FONT;
+            ctx.fillStyle = part.color ?? "#999";
+            const w = ctx.measureText(part.text).width;
+            if (cx + w <= right) {
+                ctx.fillText(part.text, cx, y);
+                cx += w + 1;
+            } else {
+                ctx.fillText(truncate(ctx, part.text, Math.max(1, right - cx)), cx, y);
+                break;
+            }
+        }
     }
 
     private drawContentRow(
@@ -563,6 +626,10 @@ export class ChatPanelRenderer {
         const h = lines.length * 18 + 12;
         ctx.fillStyle = CODE_BG;
         if ("roundRect" in ctx) {
+            // beginPath() is mandatory: roundRect() appends to the current
+            // path, so without it fill() would also paint any leftover
+            // sub-path (e.g. the avatar clip arc) drawn earlier this message.
+            ctx.beginPath();
             (ctx as any).roundRect(x, y, width, h, 4);
             ctx.fill();
         } else {
@@ -609,6 +676,11 @@ export class ChatPanelRenderer {
             ctx.fillRect(x, y, size, size);
         }
         ctx.restore();
+        // restore() does NOT reset the current path — the clip arc above
+        // would otherwise linger as the active sub-path and get filled by the
+        // next roundRect-based draw (reaction pill, code block). Clear it so
+        // no later fill() can accidentally paint over the avatar.
+        ctx.beginPath();
     }
 
     private drawAttachmentImage(
@@ -627,6 +699,28 @@ export class ChatPanelRenderer {
         }
         ctx.restore();
     }
+}
+
+// Flatten parsed content tokens into a simple inline sequence for the reply
+// preview: custom emotes stay as drawable images, everything else collapses to
+// styled text (mentions/links keep their accent color, blockquotes flatten in
+// place). Code blocks render as plain inline text since the preview is a single
+// line.
+type ReplyPart = { kind: "emote"; url: string } | { kind: "text"; text: string; color?: string };
+function flattenReplyTokens(tokens: ContentToken[]): ReplyPart[] {
+    const out: ReplyPart[] = [];
+    for (const t of tokens) {
+        switch (t.kind) {
+            case "emote": out.push({ kind: "emote", url: t.url }); break;
+            case "unicodeEmoji": out.push({ kind: "text", text: t.char }); break;
+            case "text": out.push({ kind: "text", text: t.text }); break;
+            case "mention": out.push({ kind: "text", text: t.label, color: t.color ?? LINK_COLOR }); break;
+            case "link": out.push({ kind: "text", text: t.text, color: LINK_COLOR }); break;
+            case "codeBlock": out.push({ kind: "text", text: t.text }); break;
+            case "blockquote": out.push(...flattenReplyTokens(t.inner)); break;
+        }
+    }
+    return out;
 }
 
 // URL-heuristic for "could this be animated media?". .gif is obvious; the
@@ -665,4 +759,19 @@ function formatRel(ms: number): string {
     const s = totalSec % 60;
     const pad = (n: number) => n.toString().padStart(2, "0");
     return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+}
+
+// Wall-clock time of a message in the viewer's local timezone, e.g.
+// "14:03:27 UTC-4". getTimezoneOffset() returns minutes *behind* UTC (positive
+// when behind), so negate it to get the conventional UTC offset sign.
+function formatLocalTime(epochMs: number): string {
+    const d = new Date(epochMs);
+    const pad = (n: number) => n.toString().padStart(2, "0");
+    const clock = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    const offMin = -d.getTimezoneOffset();
+    const sign = offMin >= 0 ? "+" : "-";
+    const offH = Math.floor(Math.abs(offMin) / 60);
+    const offM = Math.abs(offMin) % 60;
+    const tz = offM === 0 ? `UTC${sign}${offH}` : `UTC${sign}${offH}:${pad(offM)}`;
+    return `${clock} ${tz}`;
 }

@@ -80,6 +80,12 @@ function drawPill(
 ): void {
     ctx.fillStyle = r.me ? PILL_BG_ME : PILL_BG;
     if ("roundRect" in ctx) {
+        // beginPath() is mandatory: roundRect() appends to the current path
+        // rather than replacing it. Without this the fill would also paint
+        // whatever sub-path the previous draw call left behind — most
+        // visibly the avatar's clip arc, which would erase the profile
+        // picture the moment a reaction pill is drawn.
+        ctx.beginPath();
         (ctx as any).roundRect(x, y, w, PILL_HEIGHT, PILL_HEIGHT / 2);
         ctx.fill();
     } else {
@@ -89,6 +95,7 @@ function drawPill(
         ctx.strokeStyle = PILL_BORDER_ME;
         ctx.lineWidth = 1;
         if ("roundRect" in ctx) {
+            ctx.beginPath();
             (ctx as any).roundRect(x, y, w, PILL_HEIGHT, PILL_HEIGHT / 2);
             ctx.stroke();
         }
