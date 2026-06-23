@@ -37,3 +37,9 @@ export function describeStopCondition(input: StopConditionInput): string {
             return "Manual recording — records until you stop it or leave the call.";
     }
 }
+
+export function formatCaptureFps(s: { fpsMode: string; currentFps: number }): string {
+    return s.fpsMode === "auto"
+        ? `Auto — ${s.currentFps} fps`
+        : `${s.fpsMode} fps (fixed)`;
+}

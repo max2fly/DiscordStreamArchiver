@@ -184,7 +184,8 @@ export interface SessionMetadata {
     participantIds: string[];
     streamerIds: string[];
     settingsSnapshot: Record<string, unknown>;
-    droppedFrameCount?: number;
+    avgFps?: number;
+    fpsMode?: string;
     abnormalExit?: boolean;
     videoParts?: string[];  // ["call.webm"] or ["call.webm", "call.part2.webm", ...]
 }

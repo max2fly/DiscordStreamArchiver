@@ -225,6 +225,7 @@ function makeSession(): RecordingSession {
             appendVideoChunk: (h, bytes) => Native.appendVideoChunk(h, bytes),
             rolloverVideo: h => Native.rolloverVideo(h),
             appendChatLine: (h, k, l) => Native.appendChatLine(h, k, l),
+            appendDebugLine: (h, l) => Native.appendDebugLine(h, l),
             writeMetadata: (h, m) => Native.writeMetadata(h, m),
             finalize: h => Native.finalize(h),
             ffmpegRemuxDir: (dir, opts) => Native.ffmpegRemuxDir(dir, opts),

@@ -40,6 +40,7 @@ export class ImageCache {
     private failedUntil = new Map<string, number>();
     private failAttempts = new Map<string, number>();
     private container = getContainer();
+    private disposed = false;
 
     // maxEntries lets callers size the LRU to the media class it holds. High-
     // churn, low-reuse media (attachments, embed images) and small, bounded,
@@ -66,6 +67,7 @@ export class ImageCache {
     }
 
     preload(url: string): void {
+        if (this.disposed) return;
         if (!url) return;
         if (this.cache.has(url)) return;
         if (this.inflight.has(url)) return;
@@ -87,6 +89,13 @@ export class ImageCache {
                 img.onerror = () => reject(new Error("image load failed: " + url));
                 img.src = url;
             });
+            // If the cache was disposed while this load was in flight, drop the
+            // freshly-loaded <img> instead of leaking it into the shared
+            // container (it would otherwise outlive the session).
+            if (this.disposed) {
+                try { img.remove(); } catch { /* ignore */ }
+                return null;
+            }
             // Clear any prior failure record now that it loaded cleanly.
             this.failedUntil.delete(url);
             this.failAttempts.delete(url);
@@ -125,5 +134,20 @@ export class ImageCache {
                 try { oldestImg.remove(); } catch { /* ignore */ }
             }
         }
+    }
+
+    // Remove every <img> this cache put in the shared DOM container and stop
+    // accepting new loads. Without this the elements (and their decoded
+    // bitmaps) accumulate across sessions and progressively load the
+    // compositor — call from the owning renderer's dispose().
+    dispose(): void {
+        this.disposed = true;
+        for (const img of this.cache.values()) {
+            try { img.remove(); } catch { /* ignore */ }
+        }
+        this.cache.clear();
+        this.inflight.clear();
+        this.failedUntil.clear();
+        this.failAttempts.clear();
     }
 }

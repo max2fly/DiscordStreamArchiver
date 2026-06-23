@@ -3,11 +3,13 @@ import { layout } from "./GridLayout";
 import { drawAvatarTile, drawStreamTile } from "./TileRenderer";
 import type { ChatPanelRenderer } from "./ChatPanelRenderer";
 import { logger } from "../utils";
+import { shouldEmit, fpsInWindow, NO_STREAM_ACTIVE_FPS, IDLE_HEARTBEAT_MS, type FpsMode } from "./frameClock";
 
 export interface CompositorOpts {
     width: number;
     height: number;
-    framerate: number;
+    framerate: FpsMode;   // number (fixed) | "auto"
+    capFps: number;       // 60, or 120 when allow120FpsAuto
     bakeChat: boolean;
     chatPanelWidthPct: number;  // 0-100
     streamerOverlayBorder: boolean;
@@ -20,6 +22,9 @@ export interface CompositorCallbacks {
     onChunk: (bytes: Uint8Array) => Promise<void>;
     onError: (err: Error) => void;
     getAvatar: (tile: TileSpec) => HTMLImageElement | ImageBitmap | null;
+    // TIMING PROBE — when set (debug mode on), per-second capture diagnostics
+    // are written here (→ debug.log in the recording dir) instead of the console.
+    debugLog?: (line: string) => void;
 }
 
 export class Compositor {
@@ -32,9 +37,25 @@ export class Compositor {
     private audioTrack: MediaStreamTrack | null = null;
     private chatCanvas: HTMLCanvasElement | null = null;
 
-    droppedFrames = 0;
-    private lastFrameTs = 0;
-    private targetFrameIntervalMs: number;
+    // Output-frame metrics (replaces the old captureStream drop heuristic).
+    currentFps = 0;
+    totalEmittedFrames = 0;
+    private mode: FpsMode;
+    private capFps: number;
+    private captureTrack: CanvasCaptureMediaStreamTrack | null = null;
+    private lastEmitTs = 0;
+    private emitTimestamps: number[] = [];
+    // Per-streaming-source last decoded-frame count, to detect advancement.
+    private sourceCounters = new Map<string, { count: number }>();
+    // Set on tile changes so a no-stream grid change emits promptly.
+    private contentDirty = true;
+    // TIMING PROBE — diagnostic counters for the "missing frames" investigation.
+    private probeTickCount = 0;
+    private probeSourceAdv = 0;
+    private probeLastTs = 0;
+    private probeChunkBytes = 0;
+    private probeChunkCount = 0;
+    private onVisibility: (() => void) | null = null;
     private chunkQueue: Promise<void> = Promise.resolve();
     // Toggles on each drawFrame; when a visible message has animated content
     // we flip chatPanel.dirty on every 2nd tick so the chat layer repaints at
@@ -71,7 +92,8 @@ export class Compositor {
         const ctx = this.canvas.getContext("2d");
         if (!ctx) throw new Error("canvas 2d context unavailable");
         this.ctx = ctx;
-        this.targetFrameIntervalMs = 1000 / opts.framerate;
+        this.mode = opts.framerate;
+        this.capFps = opts.capFps;
 
         if (opts.bakeChat) {
             this.chatCanvas = document.createElement("canvas");
@@ -86,6 +108,7 @@ export class Compositor {
 
     setTiles(tiles: TileSpec[]): void {
         this.tiles = tiles;
+        this.contentDirty = true; // grid changed → emit promptly when no stream
     }
 
     async start(audioTrack: MediaStreamTrack): Promise<void> {
@@ -96,7 +119,10 @@ export class Compositor {
         // track otherwise, which makes MediaRecorder silently emit 0 bytes).
         this.drawFrame();
 
-        const stream = (this.canvas as any).captureStream(this.opts.framerate) as MediaStream;
+        // captureStream(0): the track emits a frame ONLY when we call
+        // requestFrame(). We become the frame clock (see tick()).
+        const stream = (this.canvas as any).captureStream(0) as MediaStream;
+        this.captureTrack = stream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack;
         stream.addTrack(audioTrack);
         logger.info(`captureStream tracks: video=${stream.getVideoTracks().length} audio=${stream.getAudioTracks().length}`);
         for (const t of stream.getTracks()) {
@@ -117,6 +143,11 @@ export class Compositor {
                 return;
             }
             chunkCount++;
+            // TIMING PROBE — accumulate bytes/chunks for the per-second probe line.
+            if (this.cb.debugLog) {
+                this.probeChunkBytes += ev.data.size;
+                this.probeChunkCount++;
+            }
             if (chunkCount <= 3 || chunkCount % 30 === 0) {
                 logger.info(`chunk #${chunkCount} size=${ev.data.size}`);
             }
@@ -141,12 +172,38 @@ export class Compositor {
         this.recorder.onstop = () => logger.info(`MediaRecorder stopped (total chunks received=${chunkCount})`);
         this.recorder.start(this.opts.timesliceMs);
 
-        // Start the rAF loop AFTER the recorder is running so no early ticks
-        // are wasted before capture is active.
+        // Seed one frame immediately so the track is live the moment recording
+        // starts (belt-and-suspenders alongside the first-tick emit).
+        this.emitFrame(performance.now());
+
+        // Start the scheduler loop AFTER the recorder is running.
         this.rAFHandle = requestAnimationFrame(this.tick);
+
+        // TIMING PROBE — log window visibility transitions; rAF + canvas capture
+        // throttle hard when the document is hidden/occluded, which is the
+        // leading suspect for randomly-choppy recordings. Only when debug is on.
+        if (this.cb.debugLog) {
+            this.cb.debugLog(
+                `SESSION canvas=${this.canvas.width}x${this.canvas.height} mode=${String(this.mode)} ` +
+                `capFps=${this.capFps} codec=${this.opts.codec} bitrate=${this.opts.videoBitsPerSecond} mime=${mimeType} ` +
+                // Cross-session resource counts. If these climb across back-to-back
+                // recordings (no restart), a leak is loading the compositor.
+                `domImgCache=${document.getElementById("dsa-image-cache-container")?.childElementCount ?? 0} ` +
+                `videos=${document.querySelectorAll("video").length} canvases=${document.querySelectorAll("canvas").length}`
+            );
+            this.onVisibility = () => this.cb.debugLog?.(
+                `visibilitychange hidden=${document.hidden} vis=${document.visibilityState} focus=${typeof document.hasFocus === "function" ? document.hasFocus() : "?"}`
+            );
+            document.addEventListener("visibilitychange", this.onVisibility);
+        }
     }
 
     async stop(): Promise<void> {
+        // TIMING PROBE — detach the visibility listener.
+        if (this.onVisibility) {
+            document.removeEventListener("visibilitychange", this.onVisibility);
+            this.onVisibility = null;
+        }
         if (this.rAFHandle !== null) {
             cancelAnimationFrame(this.rAFHandle);
             this.rAFHandle = null;
@@ -187,13 +244,81 @@ export class Compositor {
 
     private tick = (ts: number) => {
         if (this.rAFHandle === null) return;
-        if (this.lastFrameTs && ts - this.lastFrameTs > this.targetFrameIntervalMs * 1.5) {
-            this.droppedFrames++;
+
+        // Sample each streaming source's decoded-frame counter to detect
+        // advancement. getVideoPlaybackQuality is robust for our hidden
+        // <video> elements; webkitDecodedFrameCount is the fallback.
+        let sourceAdvanced = false;
+        let hasStreams = false;
+        for (const tile of this.tiles) {
+            const v = tile.streaming ? tile.videoEl : null;
+            if (!v || !(v.videoWidth > 0)) continue;
+            hasStreams = true;
+            const count = decodedFrameCount(v);
+            const prev = this.sourceCounters.get(tile.userId);
+            if (!prev) {
+                this.sourceCounters.set(tile.userId, { count });
+            } else if (count > prev.count) {
+                sourceAdvanced = true;
+                prev.count = count;
+            }
         }
-        this.lastFrameTs = ts;
-        this.drawFrame();
+
+        // Tell the chat panel whether a stream is active (drives chat
+        // animation gating in "when-streaming" mode).
+        this.chatPanel?.setStreamActive(hasStreams);
+
+        const hasAnimation = !!this.chatPanel?.hasVisibleAnimation();
+        const contentDirty = this.contentDirty || !!this.chatPanel?.hasPendingRender();
+
+        if (shouldEmit({
+            mode: this.mode, capFps: this.capFps, now: ts,
+            lastEmitTs: this.lastEmitTs, sourceAdvanced, hasStreams,
+            contentDirty, hasAnimation,
+            activeFps: NO_STREAM_ACTIVE_FPS, idleHeartbeatMs: IDLE_HEARTBEAT_MS
+        })) {
+            this.emitFrame(ts);
+        }
+
+        // TIMING PROBE — once-per-second snapshot to localize the missing-frames
+        // bug: rAFticks≈1 means rAF is throttled (window hidden/occluded);
+        // rAFticks high but bytes≈0 means the capture track/encoder isn't
+        // capturing despite frames being requested. Only runs when debug is on.
+        if (this.cb.debugLog) {
+            this.probeTickCount++;
+            if (sourceAdvanced) this.probeSourceAdv++;
+            if (this.probeLastTs === 0) this.probeLastTs = ts;
+            if (ts - this.probeLastTs >= 1000) {
+                this.cb.debugLog(
+                    `PROBE rAFticks=${this.probeTickCount} emitted=${this.currentFps} srcAdv=${this.probeSourceAdv} ` +
+                    `chunks=${this.probeChunkCount} bytes=${this.probeChunkBytes} hasStreams=${hasStreams} ` +
+                    `imgCache=${document.getElementById("dsa-image-cache-container")?.childElementCount ?? 0} ` +
+                    `hidden=${document.hidden} vis=${document.visibilityState} focus=${typeof document.hasFocus === "function" ? document.hasFocus() : "?"}`
+                );
+                this.probeTickCount = 0;
+                this.probeSourceAdv = 0;
+                this.probeChunkBytes = 0;
+                this.probeChunkCount = 0;
+                this.probeLastTs = ts;
+            }
+        }
+
         this.rAFHandle = requestAnimationFrame(this.tick);
     };
+
+    private emitFrame(now: number): void {
+        this.drawFrame();
+        this.captureTrack?.requestFrame();
+        this.contentDirty = false;
+        this.lastEmitTs = now;
+        this.totalEmittedFrames++;
+        this.emitTimestamps.push(now);
+        // Keep only the last ~1s of timestamps and report the rolling rate.
+        while (this.emitTimestamps.length > 0 && now - this.emitTimestamps[0] >= 1000) {
+            this.emitTimestamps.shift();
+        }
+        this.currentFps = fpsInWindow(this.emitTimestamps, now);
+    }
 
     private drawFrame(): void {
         const height = this.canvas.height;
@@ -248,4 +373,10 @@ export class Compositor {
             }
         }
     }
+}
+
+function decodedFrameCount(v: HTMLVideoElement): number {
+    const q = (v as any).getVideoPlaybackQuality?.();
+    if (q && typeof q.totalVideoFrames === "number") return q.totalVideoFrames;
+    return (v as any).webkitDecodedFrameCount ?? 0;
 }

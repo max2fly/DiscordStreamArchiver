@@ -49,13 +49,27 @@ export const settings = definePluginSettings({
     },
     videoFramerate: {
         type: OptionType.SELECT,
-        default: 60,
-        description: "Output framerate. 60 is smoother for game/screen streams; drop to 30 if the recording can't keep up (check 'Dropped frames' in the right-click info panel).",
+        description: "Output framerate. 'Auto' matches the watched stream and follows it live (tracks the fastest if several); fixed values capture at an even rate. Auto is capped at 60 unless 'Allow 120fps in Auto' is on.",
         options: [
+            { label: "Auto (match stream)", value: "auto", default: true },
             { label: "15 fps", value: 15 },
             { label: "24 fps", value: 24 },
             { label: "30 fps", value: 30 },
-            { label: "60 fps", value: 60, default: true }
+            { label: "60 fps", value: 60 }
+        ]
+    },
+    allow120FpsAuto: {
+        type: OptionType.BOOLEAN,
+        default: false,
+        description: "Let Auto mode go up to 120fps for high-refresh streams. Off = capped at 60 (recommended). 120 only applies on a 120Hz+ display."
+    },
+    chatAnimationMode: {
+        type: OptionType.SELECT,
+        description: "When to animate chat GIFs/emotes in the recording. 'When a stream is watched' keeps idle (no-stream) recordings tiny; 'Never' is smallest and lowest-CPU; 'Always' animates even when idle.",
+        options: [
+            { label: "When a stream is watched", value: "when-streaming", default: true },
+            { label: "Always", value: "always" },
+            { label: "Never", value: "never" }
         ]
     },
     videoBitrate: {
@@ -152,5 +166,10 @@ export const settings = definePluginSettings({
         type: OptionType.BOOLEAN,
         default: true,
         description: "Draw a glowing border around streaming tiles in the composite."
+    },
+    debugMode: {
+        type: OptionType.BOOLEAN,
+        default: false,
+        description: "Write per-second capture diagnostics to debug.log in each recording's folder (frame pacing, window visibility, encoder output). Use this to diagnose choppy/missing-frame recordings, then turn it back off."
     }
 });

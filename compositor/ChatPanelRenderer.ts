@@ -8,6 +8,7 @@ import { classify, EMOTE_SIZE_DEFAULT, EMOTE_SIZE_JUMBO } from "./chat/MessageSi
 import { drawEmbed, embedHeight, embedVariant } from "./chat/EmbedRenderer";
 import { drawSticker, stickerHeight, STICKER_SIZE } from "./chat/StickerRenderer";
 import { drawReactions, reactionsHeight, reactionEmoteUrl } from "./chat/ReactionsRenderer";
+import { resolveChatAnimate, type ChatAnimationMode } from "./frameClock";
 
 const PANEL_BG = "#2f3136";
 const AUTHOR_COLOR = "#ffffff";
@@ -47,6 +48,8 @@ export class ChatPanelRenderer {
     // in a replied-to message render inline instead of as raw "<:name:id>".
     private messageReplyTokens = new Map<string, ContentToken[]>();
     private dirty = true;
+    private animationMode: ChatAnimationMode;
+    private streamActive = false;
     private images: ImageCache;
     // Avatars get their own cache so the constant churn of large attachment /
     // embed images flowing through `images` can never evict a participant's
@@ -58,7 +61,12 @@ export class ChatPanelRenderer {
     private lastVisibleIds = new Set<string>();
     private mentionResolvers: MentionResolvers;
 
-    constructor(private readonly canvas: HTMLCanvasElement, resolvers?: MentionResolvers) {
+    constructor(
+        private readonly canvas: HTMLCanvasElement,
+        resolvers?: MentionResolvers,
+        animationMode: ChatAnimationMode = "always"
+    ) {
+        this.animationMode = animationMode;
         this.images = new ImageCache(() => { this.dirty = true; });
         this.avatars = new ImageCache(() => { this.dirty = true; });
         this.animated = new AnimatedEmoteCache(() => { this.dirty = true; });
@@ -125,6 +133,7 @@ export class ChatPanelRenderer {
     }
 
     hasVisibleAnimation(): boolean {
+        if (!this.animationsActive) return false;
         for (const id of this.lastVisibleIds) {
             const m = this.messages.find(x => x.id === id);
             if (m?.hasAnimated) return true;
@@ -134,6 +143,29 @@ export class ChatPanelRenderer {
 
     markDirty(): void { this.dirty = true; }
 
+    private get animationsActive(): boolean {
+        return resolveChatAnimate(this.animationMode, this.streamActive);
+    }
+
+    setStreamActive(active: boolean): void {
+        if (this.streamActive === active) return;
+        this.streamActive = active;
+        this.dirty = true; // repaint with/without animated frames
+    }
+
+    hasPendingRender(): boolean {
+        return this.dirty;
+    }
+
+    // All animated/video frame draws route through these so a single flag
+    // freezes them to their static fallback when animation is inactive.
+    private animatedFrame(url: string): CanvasImageSource | null {
+        return this.animationsActive ? this.animated.getFrame(url) : null;
+    }
+    private videoFrame(url: string): CanvasImageSource | null {
+        return this.animationsActive ? this.videos.getFrame(url) : null;
+    }
+
     getBitmap(): HTMLCanvasElement {
         if (this.dirty) this.render();
         return this.canvas;
@@ -142,6 +174,11 @@ export class ChatPanelRenderer {
     dispose(): void {
         this.animated.dispose();
         this.videos.dispose();
+        // Release the <img> elements these caches parked in the shared DOM
+        // container; otherwise they accumulate across sessions and load the
+        // compositor (confirmed via the domImgCache debug counter).
+        this.images.dispose();
+        this.avatars.dispose();
     }
 
     private cacheTokens(msg: ChatMessage): void {
@@ -241,7 +278,7 @@ export class ChatPanelRenderer {
     // static fallback in the draw path.
     private preloadMaybeAnimated(url: string, animated: boolean): void {
         this.images.preload(url);
-        if (animated) this.animated.preload(url);
+        if (animated && this.animationMode !== "never") this.animated.preload(url);
     }
 
     render(): void {
@@ -462,7 +499,7 @@ export class ChatPanelRenderer {
         // GIFs thanks to the DOM-attached container in ImageCache.
         const frameLookup = {
             getFrame: (url: string) =>
-                this.videos.getFrame(url) ?? this.animated.getFrame(url)
+                this.videoFrame(url) ?? this.animatedFrame(url)
         };
         for (const emb of msg.embeds ?? []) {
             offset += 6;
@@ -534,7 +571,7 @@ export class ChatPanelRenderer {
             if (cx >= right) break;
             if (part.kind === "emote") {
                 if (cx + REPLY_EMOTE_SIZE > right) { ctx.fillStyle = "#999"; ctx.fillText("…", cx, y); break; }
-                const img = this.animated.getFrame(part.url) ?? this.images.get(part.url);
+                const img = this.animatedFrame(part.url) ?? this.images.get(part.url);
                 if (img) ctx.drawImage(img, cx, emoteY, REPLY_EMOTE_SIZE, REPLY_EMOTE_SIZE);
                 else { ctx.fillStyle = "#444"; ctx.fillRect(cx, emoteY, REPLY_EMOTE_SIZE, REPLY_EMOTE_SIZE); }
                 cx += REPLY_EMOTE_SIZE + 2;
@@ -586,7 +623,7 @@ export class ChatPanelRenderer {
             } else if (op.op === "emote") {
                 const size = op.size;
                 const emoteY = y + (rowHeight - size) / 2;
-                const frame = this.animated.getFrame(op.url);
+                const frame = this.animatedFrame(op.url);
                 if (frame) {
                     ctx.drawImage(frame, baseX + op.x, emoteY, size, size);
                 } else {
@@ -691,7 +728,7 @@ export class ChatPanelRenderer {
         ctx.save();
         ctx.fillStyle = "#202225";
         ctx.fillRect(x, y, w, h);
-        const frame = this.animated.getFrame(url);
+        const frame = this.animatedFrame(url);
         if (frame) ctx.drawImage(frame, x, y, w, h);
         else {
             const img = this.images.get(url);

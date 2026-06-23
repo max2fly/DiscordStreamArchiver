@@ -5,6 +5,7 @@ import { StreamTap } from "./StreamTap";
 import { ChatLogger } from "./ChatLogger";
 import { Compositor } from "../compositor/Compositor";
 import { ChatPanelRenderer } from "../compositor/ChatPanelRenderer";
+import { resolveCapFps, type ChatAnimationMode } from "../compositor/frameClock";
 import type { MentionResolvers } from "../compositor/chat/ContentParser";
 import { getAllTappedStreams } from "../patches/webAudioTap";
 import { sessionStore, type SessionTrigger } from "../stores/sessionStore";
@@ -27,7 +28,8 @@ export interface RecordingStatusSnapshot {
     chatBaked: boolean;
     chatMessagesLogged: number;
     audioMode: string;
-    droppedFrames: number;
+    currentFps: number;
+    fpsMode: string;
 }
 
 export interface RecordingSessionDeps {
@@ -36,6 +38,7 @@ export interface RecordingSessionDeps {
         appendVideoChunk(handle: number, bytes: Uint8Array): Promise<void>;
         rolloverVideo(handle: number): Promise<{ partName: string }>;
         appendChatLine(handle: number, kind: "jsonl" | "csv", line: string): Promise<void>;
+        appendDebugLine(handle: number, line: string): Promise<void>;
         writeMetadata(handle: number, meta: Record<string, unknown>): Promise<void>;
         finalize(handle: number): Promise<{ path: string }>;
         ffmpegRemuxDir(dir: string, opts: any): Promise<{ path: string }>;
@@ -181,7 +184,11 @@ export class RecordingSession {
             const pct = this.deps.settings.store.chatPanelWidthPct / 100;
             chatCanvas.width = Math.floor(w * pct);
             chatCanvas.height = h;
-            this.chatPanel = new ChatPanelRenderer(chatCanvas, this.buildMentionResolvers());
+            this.chatPanel = new ChatPanelRenderer(
+                chatCanvas,
+                this.buildMentionResolvers(),
+                this.deps.settings.store.chatAnimationMode as ChatAnimationMode
+            );
         }
 
         this.chatLogger = new ChatLogger(
@@ -194,7 +201,8 @@ export class RecordingSession {
         this.compositor = new Compositor(
             {
                 width: w, height: h,
-                framerate: this.deps.settings.store.videoFramerate,
+                framerate: this.deps.settings.store.videoFramerate as (number | "auto"),
+                capFps: resolveCapFps(!!this.deps.settings.store.allow120FpsAuto),
                 bakeChat: this.deps.settings.store.bakeChatIntoVideo,
                 chatPanelWidthPct: this.deps.settings.store.chatPanelWidthPct,
                 streamerOverlayBorder: this.deps.settings.store.streamerOverlayBorder,
@@ -207,7 +215,23 @@ export class RecordingSession {
                     if (this.handle !== null) await this.deps.native.appendVideoChunk(this.handle, bytes);
                 },
                 onError: (err) => this.onRecorderError(err),
-                getAvatar: (tile) => this.deps.resolveAvatar(tile)
+                getAvatar: (tile) => this.deps.resolveAvatar(tile),
+                // Debug diagnostics → debug.log in the recording dir, only when
+                // the debug-mode setting is on. Best-effort; never disrupt capture.
+                debugLog: this.deps.settings.store.debugMode
+                    ? (line: string) => {
+                        // Fully throw-safe: optional-chain guards a missing
+                        // native method (e.g. before an app restart picks up
+                        // the new IPC handler), the try/catch guards a sync
+                        // throw, and .catch guards async rejection. Debug must
+                        // NEVER disrupt the capture loop.
+                        try {
+                            if (this.handle !== null) {
+                                this.deps.native.appendDebugLine?.(this.handle, line)?.catch(() => { /* best-effort */ });
+                            }
+                        } catch { /* best-effort */ }
+                    }
+                    : undefined
             }
         );
         if (this.chatPanel) this.compositor.attachChatPanel(this.chatPanel);
@@ -299,7 +323,8 @@ export class RecordingSession {
             chatBaked: !!this.deps.settings.store.bakeChatIntoVideo,
             chatMessagesLogged: this.chatLogger?.messageCount ?? 0,
             audioMode: String(this.deps.settings.store.audioSource ?? "auto"),
-            droppedFrames: this.compositor?.droppedFrames ?? 0
+            currentFps: Math.round(this.compositor?.currentFps ?? 0),
+            fpsMode: String(this.deps.settings.store.videoFramerate)
         };
     }
 
@@ -600,7 +625,9 @@ export class RecordingSession {
             const meta = this.initialMeta();
             meta.endTs = endTs;
             meta.durationMs = endTs - this.startedAt;
-            meta.droppedFrameCount = this.compositor?.droppedFrames ?? 0;
+            const durSec = Math.max(1, (endTs - this.startedAt) / 1000);
+            meta.avgFps = Math.round((this.compositor?.totalEmittedFrames ?? 0) / durSec);
+            meta.fpsMode = String(this.deps.settings.store.videoFramerate);
             meta.abnormalExit = this.aborted;
             await this.deps.native.writeMetadata(handle, meta as any);
 

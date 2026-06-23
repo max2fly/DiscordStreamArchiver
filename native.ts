@@ -16,6 +16,7 @@ interface Handle {
     currentVideoPath: string;
     jsonlFd: fs.promises.FileHandle;
     csvFd: fs.promises.FileHandle;
+    debugFd?: fs.promises.FileHandle | null;  // lazily opened, only when debug mode writes
     writeQueue: Promise<void>;  // single-concurrent writer
     finalized: boolean;
 }
@@ -129,6 +130,24 @@ export async function appendChatLine(
     });
 }
 
+// Diagnostic log, written to <dir>/debug.log only when the renderer's debug
+// mode is on. Best-effort: failures here must never disrupt a recording, and
+// the file is opened lazily so non-debug sessions don't create it.
+export async function appendDebugLine(
+    _: IpcMainInvokeEvent,
+    id: number,
+    line: string
+): Promise<void> {
+    const h = handles.get(id);
+    if (!h || h.finalized) return;
+    await enqueue(h, async () => {
+        if (!h.debugFd) {
+            h.debugFd = await fsp.open(path.join(h.dir, "debug.log"), "a");
+        }
+        await h.debugFd.write(`${new Date().toISOString()} ${line}\n`);
+    });
+}
+
 export async function writeMetadata(
     _: IpcMainInvokeEvent,
     id: number,
@@ -154,6 +173,7 @@ export async function finalize(
         await h.currentVideoFd.close();
         await h.jsonlFd.close();
         await h.csvFd.close();
+        if (h.debugFd) { await h.debugFd.close(); h.debugFd = null; }
     });
     h.finalized = true;
     handles.delete(id);

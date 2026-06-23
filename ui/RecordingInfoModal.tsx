@@ -7,7 +7,7 @@ import { parseCsvIds } from "../stores/whitelistStore";
 import { sessionStore, type SessionState } from "../stores/sessionStore";
 import { formatDuration } from "../utils";
 import type { RecordingButtonHooks } from "./RecordingButton";
-import { describeStopCondition, joinNames } from "./statusText";
+import { describeStopCondition, joinNames, formatCaptureFps } from "./statusText";
 
 function Row({ label, value }: { label: string; value: string }) {
     return (
@@ -64,7 +64,7 @@ function RecordingInfoModal({ modalProps, hooks }: { modalProps: any; hooks: Rec
                             <Row label="Active streams" value={String(status.activeStreamCount)} />
                             <Row label="Chat" value={status.chatBaked ? `baked · ${status.chatMessagesLogged} logged` : `${status.chatMessagesLogged} logged`} />
                             <Row label="Audio" value={status.audioMode} />
-                            <Row label="Dropped frames" value={String(status.droppedFrames)} />
+                            <Row label="Capture FPS" value={formatCaptureFps(status)} />
                             <Row label="Folder" value={status.outputDir || "(OS default)"} />
                         </>
                     ) : (
