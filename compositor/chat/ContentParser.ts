@@ -40,7 +40,17 @@ const MENTION_CHANNEL_RX = /<#(\d{5,25})>/g;
 const UNICODE_EMOJI_RX = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{1F900}-\u{1F9FF}\u{1F1E6}-\u{1F1FF}]️?/gu;
 
 function emoteUrl(id: string, animated: boolean): string {
-    return `https://cdn.discordapp.com/emojis/${id}.${animated ? "gif" : "png"}?size=48`;
+    // Animated emotes: request animated WebP, NOT GIF. Discord's CDN returns
+    // HTTP 415 for the `.gif` form of many (especially recently-uploaded)
+    // animated emotes — it serves those only as animated WebP. When the
+    // `.gif` 415s, both the decode worker's fetch and the static <img>
+    // fallback fail, leaving a gray placeholder square. The decode worker
+    // (ImageDecoder) handles image/webp frame-by-frame, and an animated-WebP
+    // <img> animates in the DOM exactly like a GIF, so the static fallback
+    // still works too.
+    return animated
+        ? `https://cdn.discordapp.com/emojis/${id}.webp?size=48&animated=true`
+        : `https://cdn.discordapp.com/emojis/${id}.png?size=48`;
 }
 
 // Line-level extraction first: code blocks and blockquotes span multiple

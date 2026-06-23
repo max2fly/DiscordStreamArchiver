@@ -9,7 +9,7 @@ import ErrorBoundary from "@components/ErrorBoundary";
 import { settings } from "./settings";
 import { setAutoRecordReevaluator } from "./stores/autoRecordControl";
 import { sessionStore } from "./stores/sessionStore";
-import { listContains } from "./stores/whitelistStore";
+import { listContains, parseCsvIds } from "./stores/whitelistStore";
 import { RecordingSession } from "./session/RecordingSession";
 import { shouldArmAbsenceTimer } from "./session/absenceTimer";
 import { captureDesktopAudio } from "./session/LoopbackAudio";
@@ -19,6 +19,12 @@ import {
     onStreamDataSeen,
     subscribeToTapChanges
 } from "./patches/webAudioTap";
+import {
+    getLocalShareAudioStream,
+    getLocalShareStream,
+    installLocalStreamTap,
+    uninstallLocalStreamTap
+} from "./patches/localStreamTap";
 import { channelContextPatch } from "./ui/ChannelContextMenu";
 import { streamContextPatch, registerStreamMenuHooks } from "./ui/StreamContextMenu";
 import { userContextPatch } from "./ui/UserContextMenu";
@@ -131,6 +137,13 @@ function getParticipants(channelId: string): TileSpec[] {
 }
 
 function getParticipantAudioStream(userId: string): MediaStream | null {
+    // Your own broadcast audio (game/app sound you're sharing) lives only in
+    // the local getDisplayMedia stream, never in the inbound tap registry.
+    // Surface it as an audio-only stream so it's mixed alongside your mic.
+    if (userId === getSelfId()) {
+        const selfShareAudio = getLocalShareAudioStream();
+        if (selfShareAudio) return selfShareAudio;
+    }
     // On Vesktop/web, our webpack patch populates the tap registry with
     // per-user MediaStreams as Discord sets up each remote participant's
     // audio pipeline. On Discord Desktop voice audio is native-only, so the
@@ -205,7 +218,8 @@ function resolveAvatar(tile: TileSpec): HTMLImageElement | null {
 }
 
 function makeSession(): RecordingSession {
-    return new RecordingSession({
+    let session: RecordingSession;
+    session = new RecordingSession({
         native: {
             startRecording: dir => Native.startRecording(dir),
             appendVideoChunk: (h, bytes) => Native.appendVideoChunk(h, bytes),
@@ -229,9 +243,23 @@ function makeSession(): RecordingSession {
         getParticipants,
         getMicStream,
         getParticipantAudioStream,
+        getSelfId,
+        getSelfShareStream: getLocalShareStream,
         onToast: (msg, onClick) => toast.show(msg, onClick),
-        resolveAvatar
+        resolveAvatar,
+        onStopped: () => {
+            // Only clear if WE are still the active session — the public stop()
+            // helper nulls currentSession before awaiting the async finalize,
+            // during which a new session may already have started; don't clobber it.
+            if (currentSession !== session) return;
+            currentSession = null;
+            if (absenceTimerHandle !== null) {
+                clearTimeout(absenceTimerHandle);
+                absenceTimerHandle = null;
+            }
+        }
     });
+    return session;
 }
 
 // When loopback mode is active we must call getDisplayMedia BEFORE any other
@@ -360,11 +388,70 @@ async function maybeAutoStart(channelId: string): Promise<void> {
     currentSession = makeSession();
     try {
         await currentSession.start({ channelId, loopbackAudioStream, onSubscribeTapChanges: subscribeToTapChanges, trigger });
-        await ingestExistingStreams(channelId);
     } catch (err) {
         logger.error("auto-start failed", err);
         toast.showError(String(err));
         currentSession = null;
+        sessionStore.set({ state: "idle" });
+        return;
+    }
+    // Best-effort: a failure here must NOT tear down the now-running session.
+    await ingestExistingStreams(channelId).catch(err => logger.warn("ingest existing streams failed", err));
+}
+
+// Users whose live streams should auto-start a recording: the explicit
+// `autoRecordStreamerUsers` whitelist plus yourself when `autoRecordOnSelfStream`
+// is on. (Self is the primary use; the whitelist generalises to streamer friends
+// so their footage isn't lost.)
+function effectiveStreamerIds(): Set<string> {
+    const ids = new Set(parseCsvIds(settings.store.autoRecordStreamerUsers));
+    if (settings.store.autoRecordOnSelfStream) {
+        const self = getSelfId();
+        if (self) ids.add(self);
+    }
+    return ids;
+}
+
+function buildStreamKey(channelId: string, userId: string): string {
+    const channel = ChannelStore.getChannel(channelId);
+    const guildId = (channel as any)?.guild_id;
+    return guildId ? `guild:${guildId}:${channelId}:${userId}` : `call:${channelId}:${userId}`;
+}
+
+async function startForStreamFlag(channelId: string, streamKey: string): Promise<void> {
+    if (currentSession) return;
+    const loopbackAudioStream = await captureLoopbackIfNeeded();
+    currentSession = makeSession();
+    try {
+        await currentSession.start({
+            channelId, anchorStreamKey: streamKey, loopbackAudioStream,
+            onSubscribeTapChanges: subscribeToTapChanges, trigger: "stream-flag"
+        });
+    } catch (err) {
+        logger.error("stream-flag start failed", err);
+        toast.showError(String(err));
+        currentSession = null;
+        sessionStore.set({ state: "idle" });
+        return;
+    }
+    // Best-effort: a failure here must NOT tear down the now-running session.
+    await ingestExistingStreams(channelId).catch(err => logger.warn("ingest existing streams failed", err));
+}
+
+// A flagged user's stream appeared. Start a stream-flag session, or extend an
+// already-running anchored session so it stays alive until this stream also ends.
+function handleFlaggedStream(streamKey: string): void {
+    const parsed = parseStreamKey(streamKey);
+    if (!parsed) return;
+    if (!effectiveStreamerIds().has(parsed.userId)) return;
+    const s = sessionStore.get();
+    if (!currentSession) {
+        startForStreamFlag(parsed.channelId, streamKey);
+        return;
+    }
+    if (s.state === "recording" && s.channelId === parsed.channelId
+        && (s.trigger === "stream-flag" || s.trigger === "stream-anchor")) {
+        currentSession.addAnchor(streamKey);
     }
 }
 
@@ -401,12 +488,15 @@ async function manualStart(channelId: string, anchorStreamKey?: string): Promise
     currentSession = makeSession();
     try {
         await currentSession.start({ channelId, anchorStreamKey, loopbackAudioStream, onSubscribeTapChanges: subscribeToTapChanges, trigger });
-        await ingestExistingStreams(channelId);
     } catch (err) {
         logger.error("manual start failed", err);
         toast.showError(String(err));
         currentSession = null;
+        sessionStore.set({ state: "idle" });
+        return;
     }
+    // Best-effort: a failure here must NOT tear down the now-running session.
+    await ingestExistingStreams(channelId).catch(err => logger.warn("ingest existing streams failed", err));
 }
 
 async function stop(): Promise<void> {
@@ -425,10 +515,41 @@ function avatarUrlForUser(userId: string, size = 64): string {
     return (u as any)?.getAvatarURL?.(undefined, size, false) ?? "";
 }
 
+// Build an avatar URL straight from a message-payload author object rather
+// than via UserStore.getUser().getAvatarURL(). The store-based path returns
+// "" for any user not in the client's local cache — and in busy channels the
+// replied-to author (referenced_message.author), and often the sender too,
+// simply isn't cached, which paints the avatar a blank gray circle. The
+// message payload always carries the author's id + avatar hash, so we can
+// construct the CDN URL without depending on cache state.
+function avatarUrlFromAuthor(author: any, size = 64): string {
+    if (!author?.id) return "";
+    if (author.avatar) {
+        // Static frame is fine for a chat avatar; webp is CORS-clean and
+        // smaller than png. (An animated a_… hash still resolves to a valid
+        // first-frame webp here.)
+        return `https://cdn.discordapp.com/avatars/${author.id}/${author.avatar}.webp?size=${size}`;
+    }
+    // No hash on the payload — the cache may still know this user (including
+    // whether they have a custom avatar), so try it before assuming default.
+    const cached = avatarUrlForUser(author.id, size);
+    if (cached) return cached;
+    // Default avatar. New username system keys it by (id >> 22) % 6; legacy
+    // discriminator accounts by discriminator % 5.
+    let idx: number;
+    if (author.discriminator && author.discriminator !== "0") {
+        idx = Number(author.discriminator) % 5;
+    } else {
+        try { idx = Number((BigInt(author.id) >> 22n) % 6n); }
+        catch { idx = 0; }
+    }
+    return `https://cdn.discordapp.com/embed/avatars/${idx}.png`;
+}
+
 function chatMessageFromPayload(m: any): ChatMessage {
     const author = m.author ?? {};
     const name = (author as any).global_name || author.username || "unknown";
-    const avatarUrl = avatarUrlForUser(author.id);
+    const avatarUrl = avatarUrlFromAuthor(author);
     const ts = typeof m.timestamp === "string" ? Date.parse(m.timestamp) : Number(m.timestamp ?? Date.now());
     const s = sessionStore.get();
     const sessionStart = s.state === "recording" ? s.startedAt : Date.now();
@@ -444,7 +565,10 @@ function chatMessageFromPayload(m: any): ChatMessage {
         replyTo = {
             authorId: refAuthor.id,
             authorName: refName,
-            avatarUrl: avatarUrlForUser(refAuthor.id, 32),
+            // Request the same size as the main sender avatar (64) so a user
+            // who appears both as a sender and as a replied-to author resolves
+            // to ONE cache entry / one fetch instead of two size variants.
+            avatarUrl: avatarUrlFromAuthor(refAuthor, 64),
             contentSnippet: snippet || "[no text]"
         };
     }
@@ -601,6 +725,17 @@ export default definePlugin({
                     stop();
                 }
             }
+            // Backup detection for flagged-streamer auto-record: selfStream
+            // flips arrive here even when STREAM_CREATE doesn't fire reliably.
+            const flagged = effectiveStreamerIds();
+            if (flagged.size > 0) {
+                for (const vs of payload.voiceStates) {
+                    if (!(vs as any).selfStream) continue;
+                    if (!vs.channelId) continue;
+                    if (!flagged.has(vs.userId)) continue;
+                    handleFlaggedStream(buildStreamKey(vs.channelId, vs.userId));
+                }
+            }
             currentSession?.onParticipantsChanged();
             if (selfState && currentSession) currentSession.onMuteStateChanged();
             // If anyone in the VC flipped selfStream (started or stopped
@@ -616,9 +751,12 @@ export default definePlugin({
 
         STREAM_CREATE: (p: StreamCreatePayload) => {
             logger.info(`STREAM_CREATE fired, streamKey=${p?.streamKey}`);
-            if (!currentSession) { logger.info("STREAM_CREATE: no active session, ignoring"); return; }
             const parsed = parseStreamKey(p.streamKey ?? "");
             if (!parsed) { logger.warn(`STREAM_CREATE: unrecognized streamKey format: ${p.streamKey}`); return; }
+            // Flagged-streamer auto-record: may start a session even when none
+            // is active, so this runs before the active-session guard.
+            handleFlaggedStream(p.streamKey);
+            if (!currentSession) { logger.info("STREAM_CREATE: no active session after flag check, ignoring"); return; }
             const s = sessionStore.get();
             if (s.state !== "recording") { logger.info(`STREAM_CREATE: session not recording (state=${s.state})`); return; }
             if (s.channelId !== parsed.channelId) { logger.info(`STREAM_CREATE: channel mismatch session=${s.channelId} stream=${parsed.channelId}`); return; }
@@ -834,6 +972,7 @@ export default definePlugin({
 
     async start() {
         initStreamSubscriptionPatches();
+        installLocalStreamTap();
         addContextMenuPatch("channel-context", channelContextPatch);
         addContextMenuPatch("stream-context", streamContextPatch);
         addContextMenuPatch("user-context", userContextPatch);
@@ -844,7 +983,9 @@ export default definePlugin({
         });
         registerRecordingButtonHooks({
             start: channelId => manualStart(channelId),
-            stop: () => stop()
+            stop: () => stop(),
+            promote: () => { currentSession?.promoteToManual(); reevaluateAbsenceTimer(); },
+            getStatus: () => currentSession?.getStatus() ?? null
         });
         setAutoRecordReevaluator(reevaluateAutoRecord);
         logger.info("DiscordStreamArchiver started");
@@ -854,6 +995,7 @@ export default definePlugin({
         removeContextMenuPatch("channel-context", channelContextPatch);
         removeContextMenuPatch("stream-context", streamContextPatch);
         removeContextMenuPatch("user-context", userContextPatch);
+        uninstallLocalStreamTap();
         if (currentSession) await currentSession.stop();
         logger.info("DiscordStreamArchiver stopped");
     }

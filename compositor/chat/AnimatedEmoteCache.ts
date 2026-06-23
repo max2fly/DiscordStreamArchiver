@@ -160,6 +160,13 @@ type WorkerMessage =
     | { type: "noTrack"; url: string; mime: string }
     | { type: "error"; url: string; err: string };
 
+// Cap on retained animated frames. Each entry is a live ImageBitmap (GPU
+// memory) AND a worker-side decoder spinning a setTimeout loop, so an
+// unbounded map leaks both memory and CPU across a long session. The visible
+// animated working set is small (tens of emotes); 150 leaves generous slack
+// while keeping the ceiling bounded.
+const MAX_FRAMES = 150;
+
 export class AnimatedEmoteCache {
     private worker: Worker | null = null;
     private workerUrl: string | null = null;
@@ -196,6 +203,7 @@ export class AnimatedEmoteCache {
             const prev = this.frames.get(msg.url);
             if (prev) { try { prev.close(); } catch { /* ignore */ } }
             this.frames.set(msg.url, msg.bitmap);
+            this.evictFrames();
             this.onFrame();
         } else if (msg.type === "noTrack") {
             logger.warn(`[AEC] no selected track for ${msg.url} (mime=${msg.mime})`);
@@ -216,7 +224,31 @@ export class AnimatedEmoteCache {
         // Worker-decoded fallback. If the worker hasn't produced a first
         // frame yet (preload still in flight), returns null — caller then
         // falls back to the static ImageCache <img> frame-0.
-        return this.frames.get(url) ?? null;
+        const f = this.frames.get(url);
+        if (f) {
+            // Re-insert to mark most-recently-used, so the on-screen working
+            // set is never the target of frame eviction.
+            this.frames.delete(url);
+            this.frames.set(url, f);
+            return f;
+        }
+        return null;
+    }
+
+    // Evict least-recently-used decoded frames once over the cap: close the
+    // bitmap (frees GPU memory) and tell the worker to dispose the decoder
+    // (stops its setTimeout decode loop). Dropping the URL from `preloaded`
+    // lets it be re-decoded if it scrolls back into view later.
+    private evictFrames(): void {
+        while (this.frames.size > MAX_FRAMES) {
+            const oldest = this.frames.keys().next().value as string | undefined;
+            if (oldest === undefined) break;
+            const bmp = this.frames.get(oldest);
+            this.frames.delete(oldest);
+            if (bmp) { try { bmp.close(); } catch { /* ignore */ } }
+            this.preloaded.delete(oldest);
+            try { this.worker?.postMessage({ cmd: "dispose", url: oldest }); } catch { /* ignore */ }
+        }
     }
 
     preload(url: string): void {

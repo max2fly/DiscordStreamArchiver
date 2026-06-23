@@ -5,21 +5,15 @@ import {
     useStateFromStores
 } from "@webpack/common";
 
+import type { RecordingStatusSnapshot } from "../session/RecordingSession";
 import { sessionStore, type SessionState } from "../stores/sessionStore";
 import { formatDuration } from "../utils";
+import { openRecordingInfoModal } from "./RecordingInfoModal";
 
-function RecordIcon({ recording, disabled }: { recording: boolean; disabled: boolean }) {
-    const color = disabled ? "var(--interactive-muted)" : "var(--status-danger)";
+function RecordIcon({ recording, color }: { recording: boolean; color: string }) {
     return (
         <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true">
-            <circle
-                cx="12"
-                cy="12"
-                r="6"
-                fill={recording ? color : "none"}
-                stroke={color}
-                strokeWidth="2"
-            />
+            <circle cx="12" cy="12" r="6" fill={recording ? color : "none"} stroke={color} strokeWidth="2" />
         </svg>
     );
 }
@@ -31,6 +25,8 @@ export interface RecordingPanelButtonProps {
 export interface RecordingButtonHooks {
     start: (channelId: string) => void;
     stop: () => void;
+    promote: () => void;
+    getStatus: () => RecordingStatusSnapshot | null;
 }
 
 let hooks: RecordingButtonHooks | null = null;
@@ -68,27 +64,41 @@ export function RecordingPanelButton(_props: RecordingPanelButtonProps) {
     ) as string | null;
 
     const recording = state.state === "recording";
+    const conditional = state.state === "recording" && state.conditional;
     const inVC = !!voiceChannelId;
     const disabled = !recording && !inVC;
 
     const now = useTick(recording);
     const elapsedMs = recording && state.state === "recording" ? now - state.startedAt : 0;
 
+    const RED = "var(--status-danger)";
+    const YELLOW = "var(--status-warning, #faa61a)";
+    const MUTED = "var(--interactive-muted)";
+    const color = disabled ? MUTED : recording ? (conditional ? YELLOW : RED) : RED;
+
     let tooltip: string;
-    if (recording) tooltip = `Stop recording (${formatDuration(elapsedMs)})`;
-    else if (inVC) tooltip = "Start recording this call";
-    else tooltip = "Join a voice channel to record";
+    if (conditional) tooltip = `Auto-recording (${formatDuration(elapsedMs)}) — click to make permanent · right-click for details`;
+    else if (recording) tooltip = `Stop recording (${formatDuration(elapsedMs)}) · right-click for details`;
+    else if (inVC) tooltip = "Start recording this call · right-click for details";
+    else tooltip = "Join a voice channel to record · right-click for details";
 
     const onClick = () => {
         if (!hooks) return;
-        if (recording) hooks.stop();
+        if (conditional) hooks.promote();
+        else if (recording) hooks.stop();
         else if (inVC && voiceChannelId) hooks.start(voiceChannelId);
+    };
+
+    const onContextMenu = (e: any) => {
+        e.preventDefault();
+        if (hooks) openRecordingInfoModal(hooks);
     };
 
     return (
         <button
             type="button"
             onClick={onClick}
+            onContextMenu={onContextMenu}
             aria-label={tooltip}
             title={tooltip}
             aria-disabled={disabled}
@@ -96,10 +106,10 @@ export function RecordingPanelButton(_props: RecordingPanelButtonProps) {
                 ...BTN_STYLE,
                 cursor: disabled ? "default" : "pointer",
                 opacity: disabled ? 0.5 : 1,
-                boxShadow: recording ? "0 0 8px var(--status-danger)" : "none"
+                boxShadow: recording ? `0 0 8px ${color}` : "none"
             }}
         >
-            <RecordIcon recording={recording} disabled={disabled} />
+            <RecordIcon recording={recording} color={color} />
         </button>
     );
 }

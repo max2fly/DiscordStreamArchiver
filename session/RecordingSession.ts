@@ -10,6 +10,25 @@ import { getAllTappedStreams } from "../patches/webAudioTap";
 import { sessionStore, type SessionTrigger } from "../stores/sessionStore";
 import type { TileSpec, ChatMessage, SessionMetadata } from "../types";
 import { logger, parseStreamKey, sessionFolderName } from "../utils";
+import { shouldStopAfterAnchorDrain } from "./streamAnchor";
+import { isConditionalSession } from "../ui/buttonState";
+import { listContains } from "../stores/whitelistStore";
+
+export interface RecordingStatusSnapshot {
+    channelName: string;
+    trigger: SessionTrigger;
+    conditional: boolean;
+    continueAfterStreamEnds: boolean;
+    startedAt: number;
+    outputDir: string;
+    participantCount: number;
+    activeStreamCount: number;
+    conditionNames: string[];
+    chatBaked: boolean;
+    chatMessagesLogged: number;
+    audioMode: string;
+    droppedFrames: number;
+}
 
 export interface RecordingSessionDeps {
     native: {
@@ -30,8 +49,18 @@ export interface RecordingSessionDeps {
     getParticipants(channelId: string): TileSpec[];
     getMicStream(): Promise<MediaStream | null>;
     getParticipantAudioStream(userId: string): MediaStream | null;
+    getSelfId(): string;
+    // Your own outbound screenshare (Vesktop/web), captured locally rather than
+    // via the inbound tap registry. null when you aren't sharing.
+    getSelfShareStream(): MediaStream | null;
     onToast: (msg: string, onClick?: () => void) => void;
     resolveAvatar: (tile: TileSpec) => HTMLImageElement | ImageBitmap | null;
+    // Fired when the session finishes stopping itself (anchor stream ended,
+    // recorder-error abort, etc.). Lets index.tsx clear its `currentSession`
+    // handle, which the public stop() helper would otherwise be the only one
+    // to do — without it a self-stopped session blocks all new recordings
+    // until you leave the channel.
+    onStopped?: () => void;
 }
 
 export interface StartOpts {
@@ -70,7 +99,9 @@ export class RecordingSession {
     // feeding the compositor.
     private screenshareLinks = new Map<string, { stream: MediaStream; videoEl: HTMLVideoElement }>();
     private tiles: TileSpec[] = [];
-    private anchorStreamKey: string | null = null;
+    private anchorStreamKeys = new Set<string>();
+    private outputDir = "";
+    private conditional = false;
     private trigger: SessionTrigger = "manual";
     // Defensive net for screenshares whose video tracks arrive late: the
     // addtrack listener in webAudioTap should catch those, but a 3s poll
@@ -85,7 +116,7 @@ export class RecordingSession {
 
     async start(opts: StartOpts): Promise<void> {
         this.channelId = opts.channelId;
-        this.anchorStreamKey = opts.anchorStreamKey ?? null;
+        this.anchorStreamKeys = new Set(opts.anchorStreamKey ? [opts.anchorStreamKey] : []);
         this.trigger = opts.trigger;
         this.startedAt = Date.now();
 
@@ -101,6 +132,7 @@ export class RecordingSession {
         const dir = outputBase
             ? `${outputBase.replace(/[/\\]+$/, "")}/${folder}`.replace(/\\/g, "/")
             : folder;
+        this.outputDir = dir;
 
         this.handle = await this.deps.native.startRecording(dir);
 
@@ -185,15 +217,11 @@ export class RecordingSession {
         // Initial metadata
         await this.deps.native.writeMetadata(this.handle, this.initialMeta());
 
-        sessionStore.set({
-            state: "recording",
-            handle: this.handle,
-            channelId: opts.channelId,
-            channelName,
-            startedAt: this.startedAt,
-            anchorStreamKey: this.anchorStreamKey,
-            trigger: this.trigger
+        this.conditional = isConditionalSession({
+            trigger: this.trigger,
+            continueAfterStreamEnds: !!this.deps.settings.store.continueRecordingAfterStreamEnds
         });
+        this.publishState();
 
         this.reconcilePollHandle = setInterval(() => {
             this.reconcileScreenshares();
@@ -202,6 +230,77 @@ export class RecordingSession {
         if (this.deps.settings.store.notifyOnStart) {
             this.deps.onToast(`Recording started: ${channelName}`);
         }
+    }
+
+    private publishState(): void {
+        if (this.handle === null || this.channelId === null) return;
+        sessionStore.set({
+            state: "recording",
+            handle: this.handle,
+            channelId: this.channelId,
+            channelName: this.deps.getChannelName(this.channelId),
+            startedAt: this.startedAt,
+            anchorStreamKeys: [...this.anchorStreamKeys],
+            trigger: this.trigger,
+            conditional: this.conditional
+        });
+    }
+
+    // Add a stream whose presence keeps an anchored session alive (a second
+    // flagged streamer going live during an existing stream-flag session).
+    addAnchor(streamKey: string): void {
+        if (this.handle === null) return;
+        this.anchorStreamKeys.add(streamKey);
+        this.publishState();
+    }
+
+    // Promote a conditional (yellow) session to unconditional (red): drop the
+    // automatic stop rules and keep recording until manual stop / leave.
+    promoteToManual(): void {
+        if (this.handle === null) return;
+        this.trigger = "manual";
+        this.anchorStreamKeys.clear();
+        this.conditional = false;
+        this.publishState();
+    }
+
+    getStatus(): RecordingStatusSnapshot {
+        const tiles = this.tiles;
+        const activeStreamCount = tiles.filter(
+            t => t.streaming && t.videoEl && t.videoEl.videoWidth > 0
+        ).length;
+        // Names of whoever is causing the stop condition: the live streamers
+        // keeping a stream session alive, or the whitelisted users present for
+        // a presence ("user") session. Surfaced as a dedicated row in the
+        // info panel so it's not buried in the explanation sentence.
+        let conditionNames: string[];
+        if (this.trigger === "stream-anchor" || this.trigger === "stream-flag") {
+            conditionNames = [...this.anchorStreamKeys].map(k => {
+                const uid = parseStreamKey(k)?.userId ?? "";
+                return tiles.find(t => t.userId === uid)?.displayName ?? uid;
+            });
+        } else if (this.trigger === "user") {
+            conditionNames = tiles
+                .filter(t => listContains(this.deps.settings.store.autoRecordUsers, t.userId))
+                .map(t => t.displayName);
+        } else {
+            conditionNames = [];
+        }
+        return {
+            channelName: this.channelId ? this.deps.getChannelName(this.channelId) : "",
+            trigger: this.trigger,
+            conditional: this.conditional,
+            continueAfterStreamEnds: !!this.deps.settings.store.continueRecordingAfterStreamEnds,
+            startedAt: this.startedAt,
+            outputDir: this.outputDir,
+            participantCount: tiles.length,
+            activeStreamCount,
+            conditionNames,
+            chatBaked: !!this.deps.settings.store.bakeChatIntoVideo,
+            chatMessagesLogged: this.chatLogger?.messageCount ?? 0,
+            audioMode: String(this.deps.settings.store.audioSource ?? "auto"),
+            droppedFrames: this.compositor?.droppedFrames ?? 0
+        };
     }
 
     async addStream(streamKey: string): Promise<void> {
@@ -239,20 +338,32 @@ export class RecordingSession {
 
     async removeStream(streamKey: string): Promise<void> {
         const tap = this.taps.get(streamKey);
-        if (!tap) return;
-        const userId = extractUserId(streamKey);
-        this.audioMixer?.removeTrack(`stream:${streamKey}`);
-        tap.dispose();
-        this.taps.delete(streamKey);
-        const idx = this.tiles.findIndex(t => t.userId === userId);
-        if (idx >= 0) {
-            this.tiles[idx] = { ...this.tiles[idx], streaming: false, videoEl: null };
+        if (tap) {
+            const userId = extractUserId(streamKey);
+            this.audioMixer?.removeTrack(`stream:${streamKey}`);
+            tap.dispose();
+            this.taps.delete(streamKey);
+            const idx = this.tiles.findIndex(t => t.userId === userId);
+            if (idx >= 0) {
+                this.tiles[idx] = { ...this.tiles[idx], streaming: false, videoEl: null };
+            }
+            this.compositor?.setTiles(this.tiles);
         }
-        this.compositor?.setTiles(this.tiles);
 
-        if (streamKey === this.anchorStreamKey
-            && !this.deps.settings.store.continueRecordingAfterStreamEnds) {
-            await this.stop();
+        // Anchor drain runs even when the key was never a tap: an anchor added
+        // via addAnchor() (the VOICE_STATE backup detection path) has no tap, but
+        // its stream ending must still be able to stop the session. Gating this
+        // behind tap existence would leave such a session recording forever.
+        if (this.anchorStreamKeys.delete(streamKey)) {
+            if (shouldStopAfterAnchorDrain({
+                trigger: this.trigger,
+                anchorCount: this.anchorStreamKeys.size,
+                continueAfterStreamEnds: !!this.deps.settings.store.continueRecordingAfterStreamEnds
+            })) {
+                await this.stop();
+            } else {
+                this.publishState();
+            }
         }
     }
 
@@ -326,6 +437,18 @@ export class RecordingSession {
                     userIdsWithVideo.set(tile.userId, tap.stream);
                     break;
                 }
+            }
+        }
+
+        // Your own outbound screenshare doesn't appear in the inbound registry;
+        // pull it from the local capture and link it to your tile like any
+        // other. The hidden <video> below is muted, so its audio (mixed
+        // separately via getParticipantAudioStream) doesn't echo.
+        const selfShare = this.deps.getSelfShareStream();
+        if (selfShare && selfShare.getVideoTracks().length > 0) {
+            const selfId = this.deps.getSelfId();
+            if (tiles.some(t => t.userId === selfId)) {
+                userIdsWithVideo.set(selfId, selfShare);
             }
         }
 
@@ -440,80 +563,97 @@ export class RecordingSession {
 
     async stop(): Promise<void> {
         if (this.handle === null) return;
-        if (this.reconcilePollHandle !== null) {
-            clearInterval(this.reconcilePollHandle);
-            this.reconcilePollHandle = null;
-        }
-        // Unsubscribe from tap updates first so no late reconciles try to
-        // touch a closing mixer.
-        this.tapUnsubscribe?.();
-        this.tapUnsubscribe = null;
-        for (const [key] of Array.from(this.taps)) await this.removeStreamInternal(key);
-        await this.compositor?.stop();
-        await this.audioMixer?.close();
-        // End the loopback capture — this releases the user's screen/window
-        // audio selection. Must happen after mixer.close so the tracks aren't
-        // yanked out from under the encoder mid-flush.
-        if (this.loopbackStream) {
-            for (const t of this.loopbackStream.getTracks()) {
-                try { t.stop(); } catch { /* ignore */ }
+        const handle = this.handle;
+        let dir: string | null = null;
+        // EVERYTHING that resets state (nulling fields, sessionStore→idle,
+        // onStopped) lives in `finally`, so a throw from teardown / writeMetadata
+        // / finalize can never leave the session stuck "recording" with a live
+        // handle — which would block all future recordings until a reload.
+        try {
+            if (this.reconcilePollHandle !== null) {
+                clearInterval(this.reconcilePollHandle);
+                this.reconcilePollHandle = null;
             }
-            this.loopbackStream = null;
-        }
-        this.participantStreamLinks.clear();
-        for (const { videoEl } of this.screenshareLinks.values()) {
-            try { videoEl.srcObject = null; videoEl.remove(); } catch { /* ignore */ }
-        }
-        this.screenshareLinks.clear();
-
-        const endTs = Date.now();
-        const meta = this.initialMeta();
-        meta.endTs = endTs;
-        meta.durationMs = endTs - this.startedAt;
-        meta.droppedFrameCount = this.compositor?.droppedFrames ?? 0;
-        meta.abnormalExit = this.aborted;
-        await this.deps.native.writeMetadata(this.handle, meta as any);
-
-        const { path: dir } = await this.deps.native.finalize(this.handle);
-
-        const format = this.deps.settings.store.outputFormat;
-        if (format === "mkv" || format === "mp4") {
-            const startedAt = Date.now();
-            if (format === "mp4") {
-                this.deps.onToast("Converting to MP4 via ffmpeg — this can take a while…");
+            // Unsubscribe from tap updates first so no late reconciles try to
+            // touch a closing mixer.
+            this.tapUnsubscribe?.();
+            this.tapUnsubscribe = null;
+            for (const [key] of Array.from(this.taps)) await this.removeStreamInternal(key);
+            await this.compositor?.stop();
+            await this.audioMixer?.close();
+            // End the loopback capture — this releases the user's screen/window
+            // audio selection. Must happen after mixer.close so the tracks aren't
+            // yanked out from under the encoder mid-flush.
+            if (this.loopbackStream) {
+                for (const t of this.loopbackStream.getTracks()) {
+                    try { t.stop(); } catch { /* ignore */ }
+                }
+                this.loopbackStream = null;
             }
-            try {
-                const { path: converted } = await this.deps.native.ffmpegRemuxDir(dir, {
-                    format,
-                    ffmpegPath: this.deps.settings.store.ffmpegPath,
-                    keepWebm: this.deps.settings.store.keepWebmAfterRemux
-                });
-                const secs = Math.round((Date.now() - startedAt) / 1000);
-                logger.info(`ffmpeg ${format} produced ${converted} in ${secs}s`);
-            } catch (err) {
-                logger.error(`ffmpeg ${format} conversion failed`, err);
-                this.deps.onToast(`ffmpeg ${format.toUpperCase()} conversion failed; .webm was still saved`);
+            this.participantStreamLinks.clear();
+            for (const { videoEl } of this.screenshareLinks.values()) {
+                try { videoEl.srcObject = null; videoEl.remove(); } catch { /* ignore */ }
             }
-        }
+            this.screenshareLinks.clear();
 
-        this.handle = null;
-        this.channelId = null;
-        this.tiles = [];
-        this.audioMixer = null;
-        this.compositor = null;
-        // dispose() tears down the hidden <video>/ImageDecoder elements the
-        // panel keeps alive for animated media. Without this they'd leak
-        // across sessions.
-        this.chatPanel?.dispose();
-        this.chatPanel = null;
-        this.chatLogger = null;
-        this.micStream?.getTracks().forEach(t => t.stop());
-        this.micStream = null;
+            const endTs = Date.now();
+            const meta = this.initialMeta();
+            meta.endTs = endTs;
+            meta.durationMs = endTs - this.startedAt;
+            meta.droppedFrameCount = this.compositor?.droppedFrames ?? 0;
+            meta.abnormalExit = this.aborted;
+            await this.deps.native.writeMetadata(handle, meta as any);
 
-        sessionStore.set({ state: "idle" });
+            ({ path: dir } = await this.deps.native.finalize(handle));
 
-        if (this.deps.settings.store.notifyOnStop) {
-            this.deps.onToast(`Saved to ${dir}`, () => this.deps.native.revealInFileManager(dir));
+            const format = this.deps.settings.store.outputFormat;
+            if (format === "mkv" || format === "mp4") {
+                const startedAt = Date.now();
+                if (format === "mp4") {
+                    this.deps.onToast("Converting to MP4 via ffmpeg — this can take a while…");
+                }
+                try {
+                    const { path: converted } = await this.deps.native.ffmpegRemuxDir(dir, {
+                        format,
+                        ffmpegPath: this.deps.settings.store.ffmpegPath,
+                        keepWebm: this.deps.settings.store.keepWebmAfterRemux
+                    });
+                    const secs = Math.round((Date.now() - startedAt) / 1000);
+                    logger.info(`ffmpeg ${format} produced ${converted} in ${secs}s`);
+                } catch (err) {
+                    logger.error(`ffmpeg ${format} conversion failed`, err);
+                    this.deps.onToast(`ffmpeg ${format.toUpperCase()} conversion failed; .webm was still saved`);
+                }
+            }
+        } catch (err) {
+            logger.error("error while stopping recording; resetting state anyway", err);
+            this.deps.onToast("Recording stopped, but finalizing the file failed — check the logs / output folder.");
+        } finally {
+            this.handle = null;
+            this.channelId = null;
+            this.tiles = [];
+            this.audioMixer = null;
+            this.compositor = null;
+            // dispose() tears down the hidden <video>/ImageDecoder elements the
+            // panel keeps alive for animated media. Without this they'd leak
+            // across sessions.
+            this.chatPanel?.dispose();
+            this.chatPanel = null;
+            this.chatLogger = null;
+            this.micStream?.getTracks().forEach(t => t.stop());
+            this.micStream = null;
+
+            sessionStore.set({ state: "idle" });
+
+            if (dir && this.deps.settings.store.notifyOnStop) {
+                const saved = dir;
+                this.deps.onToast(`Saved to ${saved}`, () => this.deps.native.revealInFileManager(saved));
+            }
+
+            // Let the owner (index.tsx) drop its handle to this session. Critical
+            // for self-initiated stops (anchor stream ended) which never go through
+            // the public stop() helper that would otherwise clear it.
+            this.deps.onStopped?.();
         }
     }
 

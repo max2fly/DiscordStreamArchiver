@@ -1,7 +1,7 @@
 // Tiny subscribable store of current recording state.
 // Shared by RecordingSession (writes) and UI (reads via useSyncExternalStore).
 
-export type SessionTrigger = "manual" | "channel" | "user" | "stream-anchor";
+export type SessionTrigger = "manual" | "channel" | "user" | "stream-anchor" | "stream-flag";
 
 export type SessionState =
     | { state: "idle" }
@@ -11,8 +11,11 @@ export type SessionState =
         channelId: string;
         channelName: string;
         startedAt: number;
-        anchorStreamKey: string | null;
+        anchorStreamKeys: string[];
         trigger: SessionTrigger;
+        // false ⇒ red button (records until manual stop / leave); true ⇒
+        // yellow button (an automatic rule could stop it early).
+        conditional: boolean;
       }
     | { state: "error"; message: string };
 

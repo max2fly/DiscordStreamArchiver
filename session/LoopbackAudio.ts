@@ -19,6 +19,7 @@
 //     loopback on their mic, which is unusual.
 
 import { logger } from "../utils";
+import { ignoreNextSelfDisplayCapture } from "../patches/localStreamTap";
 
 export async function captureDesktopAudio(): Promise<MediaStream | null> {
     if (typeof navigator.mediaDevices?.getDisplayMedia !== "function") {
@@ -26,6 +27,9 @@ export async function captureDesktopAudio(): Promise<MediaStream | null> {
         return null;
     }
     try {
+        // This is our own getDisplayMedia call (for loopback audio) — tell the
+        // local-stream tap not to mistake it for a screenshare to record.
+        ignoreNextSelfDisplayCapture();
         const displayStream = await navigator.mediaDevices.getDisplayMedia({
             video: true,
             audio: {

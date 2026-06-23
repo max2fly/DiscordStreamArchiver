@@ -7,7 +7,7 @@ import { layoutContent, setFontForStyle, type LayoutOp, type RowMeta } from "./c
 import { classify, EMOTE_SIZE_DEFAULT, EMOTE_SIZE_JUMBO } from "./chat/MessageSizer";
 import { drawEmbed, embedHeight, embedVariant } from "./chat/EmbedRenderer";
 import { drawSticker, stickerHeight, STICKER_SIZE } from "./chat/StickerRenderer";
-import { drawReactions, reactionsHeight } from "./chat/ReactionsRenderer";
+import { drawReactions, reactionsHeight, reactionEmoteUrl } from "./chat/ReactionsRenderer";
 
 const PANEL_BG = "#2f3136";
 const AUTHOR_COLOR = "#ffffff";
@@ -42,6 +42,11 @@ export class ChatPanelRenderer {
     private messageOriginalTokens = new Map<string, ContentToken[]>();
     private dirty = true;
     private images: ImageCache;
+    // Avatars get their own cache so the constant churn of large attachment /
+    // embed images flowing through `images` can never evict a participant's
+    // avatar out from under a message that's about to render it. Avatars are
+    // few (bounded by participants) and tiny, so this costs almost nothing.
+    private avatars: ImageCache;
     private animated: AnimatedEmoteCache;
     private videos: VideoFrameCache;
     private lastVisibleIds = new Set<string>();
@@ -49,6 +54,7 @@ export class ChatPanelRenderer {
 
     constructor(private readonly canvas: HTMLCanvasElement, resolvers?: MentionResolvers) {
         this.images = new ImageCache(() => { this.dirty = true; });
+        this.avatars = new ImageCache(() => { this.dirty = true; });
         this.animated = new AnimatedEmoteCache(() => { this.dirty = true; });
         this.videos = new VideoFrameCache(() => { this.dirty = true; });
         this.mentionResolvers = resolvers ?? {
@@ -140,8 +146,8 @@ export class ChatPanelRenderer {
     }
 
     private preloadMessageImages(msg: ChatMessage): void {
-        this.images.preload(msg.avatarUrl);
-        if (msg.replyTo) this.images.preload(msg.replyTo.avatarUrl);
+        this.avatars.preload(msg.avatarUrl);
+        if (msg.replyTo) this.avatars.preload(msg.replyTo.avatarUrl);
         const tokens = this.messageTokens.get(msg.id) ?? [];
         for (const tok of tokens) {
             if (tok.kind === "emote") {
@@ -200,8 +206,8 @@ export class ChatPanelRenderer {
             this.preloadMaybeAnimated(url, st.formatType === 4 || st.formatType === 2);
         }
         for (const r of msg.reactions ?? []) {
-            if (!r.emoji.id) continue;
-            const url = `https://cdn.discordapp.com/emojis/${r.emoji.id}.${r.emoji.animated ? "gif" : "png"}?size=32`;
+            const url = reactionEmoteUrl(r);
+            if (!url) continue;
             this.preloadMaybeAnimated(url, !!r.emoji.animated);
         }
     }
@@ -228,17 +234,38 @@ export class ChatPanelRenderer {
 
         const visible: ChatMessage[] = [];
         let usedHeight = 0;
+        // Index of the first message that did NOT fully fit (sits just above
+        // the top of the visible window), or -1 if every message fit.
+        let partialIdx = -1;
         for (let i = this.messages.length - 1; i >= 0; i--) {
             const msg = this.messages[i];
             const h = this.messageHeights.get(msg.id) ?? this.computeHeight(msg);
-            if (usedHeight + h + ROW_GAP > height) break;
+            if (usedHeight + h + ROW_GAP > height) { partialIdx = i; break; }
             usedHeight += h + ROW_GAP;
             visible.unshift(msg);
         }
 
-        this.lastVisibleIds = new Set(visible.map(m => m.id));
+        const y0 = height - usedHeight;
 
-        let y = height - usedHeight;
+        // Partial top message: when a message overflowed the top edge and
+        // there's empty space above the first fully-visible message, draw that
+        // message's bottom portion into the gap, clipped at the canvas top
+        // (negative y — the canvas discards the off-top pixels). Without this a
+        // tall message (e.g. a big GIF) vanishes the instant its top crosses
+        // the panel border, leaving a blank band until it fully scrolls off.
+        const partial = partialIdx >= 0 && y0 > 0 ? this.messages[partialIdx] : null;
+
+        this.lastVisibleIds = new Set(visible.map(m => m.id));
+        if (partial) this.lastVisibleIds.add(partial.id);
+
+        if (partial) {
+            const hPartial = this.messageHeights.get(partial.id) ?? this.computeHeight(partial);
+            // Bottom-align its lower edge to ROW_GAP above the first visible
+            // message; its top lands above y=0 and is clipped.
+            this.drawMessage(ctx, partial, y0 - ROW_GAP - hPartial, width);
+        }
+
+        let y = y0;
         for (const msg of visible) {
             y += this.drawMessage(ctx, msg, y, width);
             y += ROW_GAP;
@@ -575,7 +602,7 @@ export class ChatPanelRenderer {
         ctx.arc(x + size / 2, y + size / 2, size / 2, 0, Math.PI * 2);
         ctx.closePath();
         ctx.clip();
-        const img = this.images.get(url);
+        const img = this.avatars.get(url);
         if (img) ctx.drawImage(img, x, y, size, size);
         else {
             ctx.fillStyle = "#444";

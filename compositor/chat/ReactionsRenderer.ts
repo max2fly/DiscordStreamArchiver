@@ -13,7 +13,11 @@ const PILL_FONT = "13px Whitney, 'Helvetica Neue', Helvetica, Arial, sans-serif"
 
 export function reactionEmoteUrl(r: ChatReaction): string | null {
     if (!r.emoji.id) return null;
-    return `https://cdn.discordapp.com/emojis/${r.emoji.id}.${r.emoji.animated ? "gif" : "png"}?size=32`;
+    // Animated reactions: animated WebP, not GIF — Discord's CDN 415s the
+    // `.gif` form of many animated emoji (see ContentParser.emoteUrl).
+    return r.emoji.animated
+        ? `https://cdn.discordapp.com/emojis/${r.emoji.id}.webp?size=32&animated=true`
+        : `https://cdn.discordapp.com/emojis/${r.emoji.id}.png?size=32`;
 }
 
 export function reactionsHeight(

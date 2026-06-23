@@ -209,7 +209,15 @@ export class Compositor {
         // just those — the whole point of viewing is to see the stream, and
         // cramping it into one small tile next to avatar boxes defeats that.
         // Falls back to the full participant grid when nobody is streaming.
-        const streamingTiles = this.tiles.filter(t => t.streaming && t.videoEl);
+        //
+        // Only count a stream as occupying a slot when its <video> is actually
+        // producing frames (videoWidth>0). A stream the user manually stopped
+        // watching keeps its tile flagged `streaming` but stops delivering
+        // decoded video; without this check its now-frameless black box would
+        // still claim grid space and squeeze the streams you ARE watching.
+        const streamingTiles = this.tiles.filter(
+            t => t.streaming && t.videoEl && t.videoEl.videoWidth > 0 && t.videoEl.videoHeight > 0
+        );
         const tilesToRender = streamingTiles.length > 0 ? streamingTiles : this.tiles;
 
         const rects = layout(tilesToRender.length, gridRect);

@@ -22,6 +22,16 @@ export const settings = definePluginSettings({
         default: "",
         description: "Comma-separated user IDs. Auto-record when any of these users is in the VC with you (autoRecordOnJoin must be on)."
     },
+    autoRecordOnSelfStream: {
+        type: OptionType.BOOLEAN,
+        default: false,
+        description: "Auto-record whenever YOU start streaming (anchored to your stream; stops when you stop). If 'Auto-record on join' already covers this channel, that session takes over instead."
+    },
+    autoRecordStreamerUsers: {
+        type: OptionType.STRING,
+        default: "",
+        description: "Comma-separated user IDs whose LIVE STREAMS auto-start a recording (stops when the last flagged streamer stops). Managed via the right-click 'Auto-record when user… ▸ streams' menu; editing here is fine."
+    },
     absenceTimeoutSeconds: {
         type: OptionType.NUMBER,
         default: 300,
@@ -39,13 +49,13 @@ export const settings = definePluginSettings({
     },
     videoFramerate: {
         type: OptionType.SELECT,
-        default: 30,
-        description: "Output framerate.",
+        default: 60,
+        description: "Output framerate. 60 is smoother for game/screen streams; drop to 30 if the recording can't keep up (check 'Dropped frames' in the right-click info panel).",
         options: [
             { label: "15 fps", value: 15 },
             { label: "24 fps", value: 24 },
-            { label: "30 fps", value: 30, default: true },
-            { label: "60 fps", value: 60 }
+            { label: "30 fps", value: 30 },
+            { label: "60 fps", value: 60, default: true }
         ]
     },
     videoBitrate: {

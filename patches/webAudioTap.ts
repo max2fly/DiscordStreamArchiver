@@ -63,6 +63,13 @@ function notifyChange(): void {
     });
 }
 
+// Public wake-up for tap subscribers from sibling capture sources (e.g.
+// localStreamTap adopting/releasing your own outbound screenshare), so the
+// recording session re-runs its audio + screenshare reconcile.
+export function notifyTapChange(): void {
+    notifyChange();
+}
+
 // Called from the webpack-injected hook. Must be defensive — any throw here
 // propagates into Discord's rendering code.
 let diagnosticCallsLogged = 0;

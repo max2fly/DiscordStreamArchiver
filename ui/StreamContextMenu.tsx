@@ -1,10 +1,8 @@
 import { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import { Menu } from "@webpack/common";
 
-import { settings } from "../settings";
-import { triggerAutoRecordReevaluate } from "../stores/autoRecordControl";
 import { sessionStore } from "../stores/sessionStore";
-import { listAdd, listContains, listRemove } from "../stores/whitelistStore";
+import { autoRecordWhenSubmenu } from "./autoRecordMenu";
 
 export interface StreamMenuHooks {
     startForStream: (streamKey: string, channelId: string) => void;
@@ -21,28 +19,10 @@ export const streamContextPatch: NavContextMenuPatchCallback = (children, props)
     const user = p?.user;
     const channelId: string | undefined = p?.channelId ?? (streamKey ? streamKey.split(":")[1] : undefined);
     if (!streamKey || !user) return;
+    if (children.some(c => (c as any)?.props?.id === "dsa-auto-record-when")) return;
 
-    if (children.some(c => (c as any)?.props?.id === "dsa-auto-record-user")) return;
-
-    const userId = user.id;
-    const userEnabled = listContains(settings.store.autoRecordUsers, userId);
     const sessionActive = sessionStore.get().state === "recording";
-
-    const items: any[] = [
-        <Menu.MenuSeparator />,
-        <Menu.MenuCheckboxItem
-            id="dsa-auto-record-user"
-            label="Auto-record this user's streams"
-            checked={userEnabled}
-            action={() => {
-                settings.store.autoRecordUsers = userEnabled
-                    ? listRemove(settings.store.autoRecordUsers, userId)
-                    : listAdd(settings.store.autoRecordUsers, userId);
-                triggerAutoRecordReevaluate();
-            }}
-        />
-    ];
-
+    const items: any[] = [<Menu.MenuSeparator />, autoRecordWhenSubmenu(user.id)];
     if (!sessionActive && hooks && channelId) {
         items.push(
             <Menu.MenuItem

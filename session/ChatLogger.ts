@@ -23,12 +23,15 @@ export function messageToCsvLine(msg: ChatMessage): string {
 }
 
 export class ChatLogger {
+    messageCount = 0;
+
     constructor(
         private readonly io: ChatIO,
         private readonly handle: number
     ) {}
 
     async pushMessage(msg: ChatMessage): Promise<void> {
+        this.messageCount++;
         const withOp: ChatMessage = { ...msg, op: "create" };
         await Promise.all([
             this.io.appendChatLine(this.handle, "jsonl", messageToJsonLine(withOp)),
