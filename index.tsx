@@ -922,9 +922,21 @@ export default definePlugin({
     //
     // `noWarn: true` on each so the one that doesn't match doesn't log a
     // misleading "had no effect" warning to the Vencord console.
+    //
+    // MAINTENANCE: the `find` anchor below is deliberately kept identical to
+    // Vencord's stock GameActivityToggle plugin, which patches this same
+    // account-panel row. Discord reshuffles its minified bundle every few
+    // Discord updates and this string changes with it (history:
+    // WIDGETS_RTC_UPSELL_COACHMARK -> DISPLAY_NAME_STYLES_COACHMARK ->
+    // #{intl::USER_PROFILE_ACCOUNT_POPOUT_BUTTON_A11Y_LABEL}). There is no
+    // stable Vencord API for panel buttons, so when the button disappears
+    // after a Discord update, copy the current `find` from
+    // src/plugins/gameActivityToggle/index.tsx — the Vencord team updates it
+    // within days of each breaking update. The intl-key form is preferred: it
+    // is far more stable than the CSS-module class hashes used before.
     patches: [
         {
-            find: ".DISPLAY_NAME_STYLES_COACHMARK)",
+            find: "#{intl::USER_PROFILE_ACCOUNT_POPOUT_BUTTON_A11Y_LABEL}",
             replacement: [
                 {
                     match: /children:\[(?=.{0,25}?accountContainerRef)/,
