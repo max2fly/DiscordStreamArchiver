@@ -3,7 +3,7 @@ Vencord Plugin that archives voice chats / streams done via discord
 
 # REQUIRES !!! VESKTOP !!! WITH CUSTOM VENCORD INSTALL
 
-See https://docs.vencord.dev/installing/ and https://vesktop.dev/
+See: https://docs.vencord.dev/installing/custom-plugins/, https://docs.vencord.dev/installing/ and https://vesktop.dev/
 
 ## Installation
 
